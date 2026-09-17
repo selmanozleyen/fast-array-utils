@@ -76,12 +76,47 @@ def _threading_layer(layer_or_category: ThreadingLayer | TheadingCategory, /, pr
     raise ValueError(msg)  # pragma: no cover
 
 
-def _is_in_unsafe_thread_pool() -> bool:
+def _is_off_main_thread() -> bool:
+    """Whether this call is on a thread other than the one the interpreter started on."""
     import threading
 
-    current_thread = threading.current_thread()
-    # ThreadPoolExecutor threads typically have names like 'ThreadPoolExecutor-0_1'
-    return current_thread.name.startswith("ThreadPoolExecutor") and threading_layer() not in LAYERS["threadsafe"]
+    return threading.current_thread() is not threading.main_thread()
+
+
+def _launched_layer() -> ThreadingLayer | None:
+    """The layer numba launched, or None while nothing parallel has run yet."""
+    import numba
+
+    try:
+        return cast("ThreadingLayer", numba.threading_layer())
+    except ValueError:
+        return None
+
+
+def _commit_to_a_layer() -> ThreadingLayer:
+    """Make numba choose a layer, so it can be read instead of predicted.
+
+    Costs one trivial parallel call. Only worth it where the alternative is guessing which
+    layer numba would pick, which means reimplementing selection logic it does not promise.
+    """
+    import numba
+    import numpy as np
+
+    @numba.njit(parallel=True, cache=True)  # type: ignore[misc]
+    def _probe(values: object) -> float:
+        total = 0.0
+        for i in numba.prange(values.shape[0]):  # type: ignore[attr-defined]
+            total += values[i]  # type: ignore[index]
+        return total
+
+    _probe(np.zeros(1, dtype=np.float64))
+    layer = _launched_layer()
+    assert layer is not None, "a parallel call just ran, so a layer is committed"
+    return layer
+
+
+def _is_on_unsafe_thread(layer: ThreadingLayer | None) -> bool:
+    return layer is not None and _is_off_main_thread() and layer not in LAYERS["threadsafe"]
 
 
 @overload
@@ -111,8 +146,14 @@ def njit[**P, R](fn: Callable[P, R] | None = None, /) -> Callable[P, R] | Callab
 
         @wraps(f)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            layer = _launched_layer()
+            if layer is None and _is_off_main_thread():  # pragma: no cover
+                # Only here: on the main thread an unknown layer is no hazard, so nothing is
+                # launched and the choice stays the caller's to make.
+                layer = _commit_to_a_layer()
+
             msg = None
-            if _is_in_unsafe_thread_pool():  # pragma: no cover
+            if _is_on_unsafe_thread(layer):  # pragma: no cover
                 msg = f"Detected unsupported threading environment. Trying to run {f.__name__} in serial mode. In case of problems, install `tbb`."
             elif _needs_parallel_runtime_probe() and not _parallel_numba_runtime_is_safe():
                 msg = (
