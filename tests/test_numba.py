@@ -125,8 +125,9 @@ def _set_runtime(
 
 
 def _install_fake_njit(monkeypatch: pytest.MonkeyPatch, calls: list[bool]) -> None:
-    def fake_njit(_fn: object, /, *, cache: bool, parallel: bool) -> Callable[..., bool]:
+    def fake_njit(_fn: object, /, *, cache: bool, parallel: bool, nogil: bool) -> Callable[..., bool]:
         assert cache is True
+        assert nogil is True
 
         def compiled(*_args: object, **_kwargs: object) -> bool:
             calls.append(parallel)

@@ -104,7 +104,9 @@ def njit[**P, R](fn: Callable[P, R] | None = None, /) -> Callable[P, R] | Callab
 
         # use distinct names so numba doesn’t reuse the wrong version’s cache
         fns: dict[bool, Callable[P, R]] = {
-            parallel: numba.njit(_copy_function(f, __qualname__=f"{f.__qualname__}-{'parallel' if parallel else 'serial'}"), cache=True, parallel=parallel)
+            parallel: numba.njit(
+                _copy_function(f, __qualname__=f"{f.__qualname__}-{'parallel' if parallel else 'serial'}"), cache=True, parallel=parallel, nogil=True
+            )
             for parallel in (True, False)
         }
 
