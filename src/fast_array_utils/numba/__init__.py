@@ -11,6 +11,7 @@ r"""Numba utilities, mainly used to deal with :ref:`numba-threading-layer` of :d
 
 from __future__ import annotations
 
+import os
 import sys
 import warnings
 from functools import update_wrapper, wraps
@@ -39,13 +40,47 @@ LAYERS: dict[TheadingCategory, set[ThreadingLayer]] = {
 }
 
 
+def _launched_layer() -> ThreadingLayer | None:
+    """Get the threading layer numba launched in this process, or `None` if no parallel code has run yet."""
+    if "numba" not in sys.modules:
+        return None
+    import numba
+
+    try:
+        return cast("ThreadingLayer", numba.threading_layer())
+    except ValueError:
+        return None
+
+
+_inherited_layer: ThreadingLayer | None = None
+"""Threading layer the parent process had launched when forking this process."""
+
+
+def _record_inherited_layer() -> None:
+    global _inherited_layer  # noqa: PLW0603
+    _inherited_layer = _launched_layer()
+
+
+if hasattr(os, "register_at_fork"):  # not on Windows
+    os.register_at_fork(after_in_child=_record_inherited_layer)
+
+
+def _is_in_unsafe_fork() -> bool:
+    # A forked child can’t use a non-forksafe layer its parent launched (GNU OpenMP terminates the child), so we fall back to serial.
+    return _inherited_layer is not None and _inherited_layer not in LAYERS["forksafe"]
+
+
 def _is_on_unsafe_thread() -> bool:
     import threading
+
+    if threading.current_thread() is threading.main_thread():
+        return False
 
     from ._parallel_runtime import _parallel_numba_runtime_layer
 
     # We deem it unsafe if the caller is not the main thread and the layer numba launches isn’t threadsafe, and therefore fall back to serial.
-    return threading.current_thread() is not threading.main_thread() and _parallel_numba_runtime_layer() not in LAYERS["threadsafe"]
+    # Once numba launched a layer in this process, we know it for sure and don’t need to probe.
+    return (_launched_layer() or _parallel_numba_runtime_layer()) not in LAYERS["threadsafe"]
 
 
 @overload
@@ -76,7 +111,12 @@ def njit[**P, R](fn: Callable[P, R] | None = None, /) -> Callable[P, R] | Callab
         @wraps(f)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             msg = None
-            if _is_on_unsafe_thread():  # pragma: no cover
+            if _is_in_unsafe_fork():
+                msg = (
+                    f"Detected a forked process that inherited numba’s non-forksafe {_inherited_layer!r} threading layer. "
+                    f"Running {f.__name__} in serial mode. Set `NUMBA_THREADING_LAYER=forksafe` or install `tbb` to avoid this fallback."
+                )
+            elif _is_on_unsafe_thread():  # pragma: no cover
                 msg = f"Detected unsupported threading environment. Trying to run {f.__name__} in serial mode. In case of problems, install `tbb`."
             elif _needs_parallel_runtime_probe() and _parallel_numba_runtime_layer() is None:
                 msg = (

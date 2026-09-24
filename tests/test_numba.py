@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import importlib
+import os
 import subprocess
+import sys
 import threading
 import warnings
 from typing import TYPE_CHECKING
@@ -15,6 +17,7 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from numpy.typing import NDArray
 
@@ -56,9 +59,34 @@ def test_is_on_unsafe_thread(monkeypatch: pytest.MonkeyPatch, layer: fa_numba.Th
     caller = threading.main_thread() if on_main else threading.Thread()
 
     monkeypatch.setattr(threading, "current_thread", lambda: caller)
+    monkeypatch.setattr(fa_numba, "_launched_layer", lambda: None)
     monkeypatch.setattr(probe, "_parallel_numba_runtime_layer", lambda: layer)
 
     assert fa_numba._is_on_unsafe_thread() is expected
+
+
+def test_is_on_unsafe_thread_prefers_launched_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller = threading.Thread()
+    monkeypatch.setattr(threading, "current_thread", lambda: caller)
+    monkeypatch.setattr(fa_numba, "_launched_layer", lambda: "omp")
+    monkeypatch.setattr(probe, "_parallel_numba_runtime_layer", lambda: pytest.fail("probe should not run"))
+
+    assert fa_numba._is_on_unsafe_thread() is False
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected"),
+    [
+        pytest.param(None, False, id="not-forked"),
+        pytest.param("workqueue", False, id="forksafe"),
+        pytest.param("omp", True, id="not-forksafe"),
+    ],
+)
+def test_is_in_unsafe_fork(monkeypatch: pytest.MonkeyPatch, inherited: fa_numba.ThreadingLayer | None, *, expected: bool) -> None:
+    monkeypatch.setitem(fa_numba.LAYERS, "forksafe", {"tbb", "workqueue"})  # omp is only non-forksafe on linux
+    monkeypatch.setattr(fa_numba, "_inherited_layer", inherited)
+
+    assert fa_numba._is_in_unsafe_fork() is expected
 
 
 def _set_runtime(
@@ -253,6 +281,7 @@ def test_njit_chooses_version(
     calls: list[bool] = []
     _install_fake_njit(monkeypatch, calls)
 
+    monkeypatch.setattr(fa_numba, "_is_in_unsafe_fork", lambda: False)
     monkeypatch.setattr(fa_numba, "_is_on_unsafe_thread", lambda: unsafe_thread)
     if needs_probe is None:
         monkeypatch.setattr(probe, "_needs_parallel_runtime_probe", lambda: pytest.fail("probe should not be consulted"))
@@ -274,6 +303,53 @@ def test_njit_chooses_version(
         with pytest.warns(UserWarning, match=warning):
             assert wrapped() is expected
     assert calls == [expected]
+
+
+def test_njit_serial_in_unsafe_fork(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[bool] = []
+    _install_fake_njit(monkeypatch, calls)
+    monkeypatch.setattr(fa_numba, "_is_in_unsafe_fork", lambda: True)
+    monkeypatch.setattr(fa_numba, "_inherited_layer", "omp")
+    monkeypatch.setattr(fa_numba, "_is_on_unsafe_thread", lambda: pytest.fail("thread check should not run"))
+
+    with pytest.warns(UserWarning, match=r"forked process that inherited numba’s non-forksafe 'omp'"):
+        assert fa_numba.njit(_return_true)() is False
+    assert calls == [False]
+
+
+_FORK_SCRIPT = """
+import os
+import numba
+import numpy as np
+from fast_array_utils import numba as fa_numba
+
+@fa_numba.njit
+def sum_prange(values):
+    total = 0.0
+    for i in numba.prange(values.shape[0]):
+        total += values[i]
+    return total
+
+values = np.arange(10, dtype=np.float64)
+assert sum_prange(values) == 45  # launches the threading layer in the parent
+if (pid := os.fork()) == 0:
+    ok = fa_numba._inherited_layer == numba.threading_layer() and sum_prange(values) == 45
+    os._exit(0 if ok else 1)
+assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_fork_after_launch(tmp_path: Path) -> None:
+    """A forked child must not run in parallel on its parent’s GNU OpenMP, or numba terminates it."""
+    env = dict(os.environ)
+    if sys.platform == "linux":  # omp (GNU OpenMP) is not forksafe here
+        pytest.importorskip("numba.np.ufunc.omppool", exc_type=ImportError)
+        env["NUMBA_THREADING_LAYER"] = "omp"
+    script = tmp_path / "fork_script.py"
+    script.write_text(_FORK_SCRIPT)
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, check=False, env=env, text=True, timeout=120)  # noqa: S603
+    assert result.returncode == 0, result.stderr
 
 
 def test_serial_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
