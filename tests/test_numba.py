@@ -17,6 +17,7 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Any
 
     from numpy.typing import NDArray
 
@@ -108,10 +109,12 @@ def _set_runtime(
         monkeypatch.setattr(probe, "LAYERS", layers)
 
 
-def _install_fake_njit(monkeypatch: pytest.MonkeyPatch, calls: list[bool], *, expected_nogil: bool = True) -> None:
-    def fake_njit(_fn: object, /, *, cache: bool, parallel: bool, nogil: bool) -> Callable[..., bool]:
+def _install_fake_njit(monkeypatch: pytest.MonkeyPatch, calls: list[bool], **expected: object) -> None:
+    expected = {"nogil": True, "fastmath": False, "forceinline": False, **expected}
+
+    def fake_njit(_fn: object, /, *, cache: bool, parallel: bool, **options: object) -> Callable[..., bool]:
         assert cache is True
-        assert nogil is expected_nogil
+        assert options == expected
 
         def compiled(*_args: object, **_kwargs: object) -> bool:
             calls.append(parallel)
@@ -318,9 +321,30 @@ def test_serial_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result == pytest.approx(np.sum(values))
 
 
-def test_njit_nogil(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_njit(monkeypatch, [], expected_nogil=False)
-    fa_numba.njit(nogil=False)(_return_true)
+@pytest.mark.parametrize(
+    "options",
+    [pytest.param({"nogil": False}, id="nogil"), pytest.param({"fastmath": True}, id="fastmath"), pytest.param({"forceinline": True}, id="forceinline")],
+)
+def test_njit_options(monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]) -> None:
+    _install_fake_njit(monkeypatch, [], **options)
+    fa_numba.njit(**options)(_return_true)
+
+
+def _double(x: float) -> float:
+    return x * 2.0
+
+
+@pytest.mark.parametrize("inline", ["never", "always"])
+def test_njit_callable_from_jitted_code(inline: fa_numba.Inline) -> None:
+    helper = fa_numba.njit(inline=inline)(_double)
+
+    @numba.njit
+    def caller(values: NDArray[np.float64]) -> float:
+        return helper(values[0]) + helper(values[1])
+
+    assert caller(np.array([1.0, 2.0])) == 6.0
+    llvm_ir = next(iter(caller.inspect_llvm().values()))
+    assert ("_double" in llvm_ir) is (inline == "never")
 
 
 _FORK_SCRIPT = """

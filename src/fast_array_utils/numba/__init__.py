@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-__all__ = ["TheadingCategory", "ThreadingLayer", "njit"]
+__all__ = ["Inline", "TheadingCategory", "ThreadingLayer", "njit"]
 
 
 type TheadingCategory = Literal["default", "safe", "threadsafe", "forksafe"]
@@ -69,11 +69,21 @@ def _is_in_unsafe_fork() -> bool:
     return _inherited_layer is not None and _inherited_layer not in LAYERS["forksafe"]
 
 
+type Inline = Literal["never", "always"]
+"""When numba inlines a function into jitted callers, see :ref:`numba:notes-on-inlining`."""
+
+
 @overload
-def njit[**P, R](fn: Callable[P, R], /, *, nogil: bool = True) -> Callable[P, R]: ...
+def njit[**P, R](
+    fn: Callable[P, R], /, *, nogil: bool = True, fastmath: bool = False, inline: Inline = "never", forceinline: bool = False
+) -> Callable[P, R]: ...
 @overload
-def njit[**P, R](*, nogil: bool = True) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
-def njit[**P, R](fn: Callable[P, R] | None = None, /, *, nogil: bool = True) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+def njit[**P, R](
+    *, nogil: bool = True, fastmath: bool = False, inline: Inline = "never", forceinline: bool = False
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+def njit[**P, R](
+    fn: Callable[P, R] | None = None, /, *, nogil: bool = True, fastmath: bool = False, inline: Inline = "never", forceinline: bool = False
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Jit-compile a function using numba.
 
     On call, this function dispatches to a parallel or serial numba function,
@@ -82,15 +92,29 @@ def njit[**P, R](fn: Callable[P, R] | None = None, /, *, nogil: bool = True) -> 
     (GNU OpenMP on Linux), it runs the serial function.
     TBB is only fork-safe when forked from the thread that launched it, which isn’t detected.
 
+    Jitted callers (e.g. another :func:`njit` function) can call it too.
+    They always get the serial version, since the caller already decided whether to run in parallel.
+
     Parameters
     ----------
     nogil
         Release the GIL while the compiled function runs (see :func:`numba.jit`).
+    fastmath
+        Allow unsafe floating point transformations, e.g. reordering sums (see :func:`numba.jit`).
+        This changes results, so don’t use it where accuracy matters.
+    inline
+        Inline the function’s numba IR into jitted callers.
+        Only has an effect when called from jitted code, and makes every caller compile it again.
+    forceinline
+        Mark the function to be always inlined by LLVM (see :func:`numba.jit`).
     """
     # See https://github.com/numbagg/numbagg/pull/201/files#r1409374809
 
+    options = dict(nogil=nogil, fastmath=fastmath, forceinline=forceinline)
+
     def decorator(f: Callable[P, R], /) -> Callable[P, R]:
         import numba
+        from numba.extending import overload as numba_overload
 
         from ._parallel_runtime import _needs_parallel_runtime_probe, _parallel_numba_runtime_layer
 
@@ -99,7 +123,12 @@ def njit[**P, R](fn: Callable[P, R] | None = None, /, *, nogil: bool = True) -> 
         # use distinct names so numba doesn’t reuse the wrong version’s cache
         fns: dict[bool, Callable[P, R]] = {
             parallel: numba.njit(
-                _copy_function(f, __qualname__=f"{f.__qualname__}-{'parallel' if parallel else 'serial'}"), cache=True, parallel=parallel, nogil=nogil
+                _copy_function(f, __qualname__=f"{f.__qualname__}-{'parallel' if parallel else 'serial'}"),
+                cache=True,
+                parallel=parallel,
+                nogil=nogil,
+                fastmath=fastmath,
+                forceinline=forceinline,
             )
             for parallel in (True, False)
         }
@@ -123,6 +152,9 @@ def njit[**P, R](fn: Callable[P, R] | None = None, /, *, nogil: bool = True) -> 
             if not (run_parallel := msg is None):
                 warnings.warn(msg, UserWarning, stacklevel=2)
             return fns[run_parallel](*args, **kwargs)
+
+        # let jitted code call `wrapper`: numba compiles `f` into the caller, serially
+        numba_overload(wrapper, inline=inline, strict=False, jit_options=options)(lambda *_args, **_kwargs: f)
 
         return wrapper
 
