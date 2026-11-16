@@ -55,10 +55,19 @@ All of them support an `axis` and `dtype` parameter:
    mean = stats.mean(arr_2d)
    row_means, row_vars = stats.mean_var(arr_2d, axis=1)
 
+Use ``fast_array_utils.linalg.matmul`` to multiply a CSR matrix with a dense or CSR matrix in parallel,
+e.g. to sum each cell’s neighbors weighted by a kNN graph:
+
+.. code:: python
+
+   from fast_array_utils.linalg import matmul
+
+   dense_product = matmul(csr_weights, dense_or_csr_arr)
+
 installation
 ------------
 
-To use ``fast_array_utils.stats`` or ``fast_array_utils.conv``:
+To use ``fast_array_utils.stats``, ``fast_array_utils.linalg``, or ``fast_array_utils.conv``:
 
 .. code:: bash
 
