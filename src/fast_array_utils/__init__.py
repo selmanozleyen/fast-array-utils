@@ -8,6 +8,10 @@
     This submodule requires :doc:`numba <numba:index>` to be installed
     and contains statistics utilities.
 
+:mod:`fast_array_utils.linalg`
+    This submodule requires :doc:`numba <numba:index>` to be installed
+    and contains linear algebra utilities.
+
 :mod:`fast_array_utils.numba`
     This submodule contains numba utilities.
 
@@ -18,10 +22,10 @@
 
 from __future__ import annotations
 
-from . import _plugins, conv, numba, stats, types
+from . import _plugins, conv, linalg, numba, stats, types
 
 
-__all__ = ["conv", "numba", "stats", "types"]
+__all__ = ["conv", "linalg", "numba", "stats", "types"]
 
 _plugins.patch_dask()
 _plugins.register_numba_sparse()
